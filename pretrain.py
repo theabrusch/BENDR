@@ -38,6 +38,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Pretrains a BENDER model.")
     parser.add_argument('--config', default="configs/pretraining.yml", help="The DN3 config file to use.")
     parser.add_argument('--hidden-size', default=512, type=int, help="The hidden size of the encoder.")
+    parser.add_argument('--mpnn', default = False, action='store_true', help="Whether to use MPNN or not.")
     parser.add_argument('--resume', default=None, type=int, help="Whether to continue training the encoder from the "
                                                                  "specified epoch.")
     parser.add_argument('--num-workers', default=6, type=int)

@@ -361,10 +361,54 @@ class _BENDREncoder(nn.Module):
         for param in self.parameters():
             param.requires_grad = unfreeze
 
+class MPNN(nn.Module):
+    def __init__(self, input_dim, num_message_passing_rounds, feat_do):
+        super().__init__()
+        # message passing networks
+        self.per_channel = False
+        self.message_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim*2, input_dim),
+                nn.Dropout(feat_do),
+                nn.ReLU(),
+        )
+            for _ in range(num_message_passing_rounds)
+        ])
 
+        # Readout layer
+        self.readout_net = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.Dropout(feat_do),
+            nn.ReLU(),
+            nn.Linear(input_dim, input_dim),
+        )
+    
+    def get_view_ids(self, b, ch, device):
+        view_id = torch.arange(b).unsqueeze(1).repeat(1, ch).view(-1).to(device)
+        message_from = torch.arange(b*ch).unsqueeze(1).repeat(1, (ch-1)).view(-1).to(device)
+        message_to = torch.arange(b*ch).view(b, ch).unsqueeze(1).repeat(1, ch, 1)
+        idx = ~torch.eye(ch).view(1, ch, ch).repeat(b, 1, 1).bool()
+        message_to = message_to[idx].view(-1).to(device)
+
+        return view_id, message_from, message_to
+
+    def forward(self, view_id, message_from, message_to, latents, ch, batch_size):
+        latents = latents.transpose(2,1)
+        for message_net in self.message_nets:
+            # divide by ch-1 to take mean
+            message = message_net(torch.cat([latents[message_from], latents[message_to]], dim=-1))/(ch-1)
+            # Sum messages
+            latents = latents.index_add(0, message_to, message)
+
+        # average across nodes 
+        y = torch.zeros(batch_size, *latents.shape[1:]).to(latents.device)
+        y = y.index_add(0, view_id, latents)/ch
+        #y.put_(view_id, latents, accumulate = True)/ch
+        return self.readout_net(y)
+    
 class ConvEncoderBENDR(_BENDREncoder):
     def __init__(self, in_features, encoder_h=256, enc_width=(3, 2, 2, 2, 2, 2),
-                 dropout=0., projection_head=False, enc_downsample=(3, 2, 2, 2, 2, 2)):
+                 dropout=0., projection_head=False, enc_downsample=(3, 2, 2, 2, 2, 2), mpnn = False):
         super().__init__(in_features, encoder_h)
         self.encoder_h = encoder_h
         if not isinstance(enc_width, (list, tuple)):
@@ -372,6 +416,11 @@ class ConvEncoderBENDR(_BENDREncoder):
         if not isinstance(enc_downsample, (list, tuple)):
             enc_downsample = [enc_downsample]
         assert len(enc_downsample) == len(enc_width)
+        self.mpnn = mpnn
+
+        if mpnn:
+            self.mpnn_network = MPNN(encoder_h, num_message_passing_rounds=3, feat_do=dropout)
+            in_features = 1
 
         # Centerable convolutions make life simpler
         enc_width = [e if e % 2 else e+1 for e in enc_width]
@@ -421,9 +470,26 @@ class ConvEncoderBENDR(_BENDREncoder):
         for factor in self._downsampling:
             samples = ceil(samples / factor)
         return samples
+    
+    def get_view_ids(self, b, ch, device):
+        view_id = torch.arange(b).unsqueeze(1).repeat(1, ch).view(-1).to(device)
+        message_from = torch.arange(b*ch).unsqueeze(1).repeat(1, (ch-1)).view(-1).to(device)
+        message_to = torch.arange(b*ch).view(b, ch).unsqueeze(1).repeat(1, ch, 1)
+        idx = ~torch.eye(ch).view(1, ch, ch).repeat(b, 1, 1).bool()
+        message_to = message_to[idx].view(-1).to(device)
+
+        return view_id, message_from, message_to
 
     def forward(self, x):
-        return self.encoder(x)
+        b, ch, ts = x.shape
+        x = x.reshape(b*ch, 1, ts)
+        latents = self.encoder(x)
+
+        if self.mpnn:
+            view_id, message_from, message_to = self.get_view_ids(b, ch, latents.device)
+            out_mpnn = self.mpnn_network(view_id, message_from, message_to, latents, ch, b)
+
+        return latents
 
 
 # FIXME this is redundant with part of the contextualizer
